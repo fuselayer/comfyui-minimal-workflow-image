@@ -3,4 +3,4 @@ Fixed implementation of the export workflow image utility from pythongosssss/Com
 
 All nodes should display and all node links should be visible and render 1:1 to their actual states in ComfyUI.
 
-![Workflow Diagram](./images/example-workflow.svg)
+![Workflow Diagram](./example-workflow.svg)
