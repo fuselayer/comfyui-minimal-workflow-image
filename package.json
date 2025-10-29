@@ -1,0 +1,13 @@
+{
+  "name": "minimal-workflow-image",
+  "version": "1.0.0",
+  "description": "Minimal implementation of ComfyUI workflow image functionality",
+  "main": "workflowImage.js",
+  "scripts": {
+    "start": "python -m http.server 8000",
+    "test": "echo \"No tests specified\""
+  },
+  "keywords": ["comfyui", "workflow", "image", "svg", "png"],
+  "author": "",
+  "license": "MIT"
+}
