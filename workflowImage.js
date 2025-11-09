@@ -181,6 +181,7 @@ class WorkflowImage {
 	}
 
 	getDrawTextConfig(_, widget) {
+		// Draw in graph coordinates so transforms (offset/scale/DPR) place it correctly
 		return {
 			x: 10,
 			y: widget.last_y + 10,
@@ -189,7 +190,7 @@ class WorkflowImage {
 	}
 
 	updateView(bounds) {
-		// Render the whole graph at devicePixelRatio resolution
+		// Render the whole graph at devicePixelRatio resolution (raster path)
 		const dpr = Math.max(1, window.devicePixelRatio || 1);
 		const width = bounds[2] - bounds[0];
 		const height = bounds[3] - bounds[1];
@@ -294,7 +295,7 @@ class WorkflowImage {
 			fileInput = document.createElement("input");
 			Object.assign(fileInput, {
 				type: "file",
-				style: "display: none",
+				style: "display: " + "none",
 				onchange: () => {
 					app.handleFile(fileInput.files[0]);
 				}
@@ -644,11 +645,11 @@ class SvgWorkflowImage extends WorkflowImage {
 	}
 
 	getDrawTextConfig(_, widget) {
-		const domWrapper = widget.inputEl.closest(".dom-widget") ?? widget.inputEl;
+		// IMPORTANT: draw in graph coordinates (like PNG), not DOM coords
 		return {
-			x: parseInt(domWrapper.style.left),
-			y: parseInt(domWrapper.style.top),
-			resetTransform: true
+			x: 10,
+			y: widget.last_y + 10,
+			resetTransform: false
 		};
 	}
 
@@ -662,28 +663,51 @@ class SvgWorkflowImage extends WorkflowImage {
 	}
 
 	updateView(bounds) {
+		// Reuse parent’s DS/offset prep (raster dpr settings don't affect svgCtx)
 		super.updateView(bounds);
 		this.createSvgCtx(bounds);
 	}
 
 	createSvgCtx(bounds) {
-		const ctx = this.state.ctx;
 		const width = bounds[2] - bounds[0];
 		const height = bounds[3] - bounds[1];
+		const dpr = Math.max(1, window.devicePixelRatio || 1);
 
-		const svgCtx = (this.svgCtx = new C2S(width, height));
+		// Create SVG at DPR-sized backing store, then scale content by DPR.
+		const svgCtx = (this.svgCtx = new C2S(Math.round(width * dpr), Math.round(height * dpr)));
 		svgCtx.canvas.getBoundingClientRect = function () {
 			return { width: svgCtx.width, height: svgCtx.height };
 		};
 
-		// Draw a full-size background rect FIRST (avoids partial background issues)
+		// Match PNG export pipeline: scale by DPR so engine drawing lands correctly
+		if (typeof svgCtx.scale === "function") {
+			svgCtx.scale(dpr, dpr);
+		} else if (typeof svgCtx.transform === "function") {
+			svgCtx.transform(dpr, 0, 0, dpr, 0, 0);
+		}
+
+		// Full-size background AFTER scale so width/height are logical units
 		const bg = getCanvasBackgroundColor();
 		svgCtx.save?.();
 		svgCtx.fillStyle = bg;
 		svgCtx.fillRect(0, 0, width, height);
 		svgCtx.restore?.();
 
-		// Override image handling to convert <img> to canvas if needed
+		// Provide minimal canvas API compatibility
+		const prevCtx = this.state.ctx;
+
+		// Proxy getTransform/resetTransform to previous 2D context if needed
+		svgCtx.getTransform = function () {
+			return prevCtx.getTransform();
+		};
+		svgCtx.resetTransform = function () {
+			return prevCtx.resetTransform();
+		};
+
+		// Ensure roundRect exists
+		svgCtx.roundRect = svgCtx.rect;
+
+		// Override drawImage to embed external IMG as bitmap
 		const drawImage = svgCtx.drawImage;
 		svgCtx.drawImage = function (...args) {
 			const image = args[0];
@@ -698,19 +722,12 @@ class SvgWorkflowImage extends WorkflowImage {
 			return drawImage.apply(this, args);
 		};
 
-		// Implement missing required functions
-		svgCtx.getTransform = function () {
-			return ctx.getTransform();
-		};
-		svgCtx.resetTransform = function () {
-			return ctx.resetTransform();
-		};
-		svgCtx.roundRect = svgCtx.rect;
-
+		// Swap ctx so LGraphCanvas draws into our SVG
 		app.canvas.ctx = svgCtx;
 	}
 
 	getBlob(workflow) {
+		// Keep a style background as well (harmless redundancy)
 		let svg = this.svgCtx
 			.getSerializedSvg(true)
 			.replace("<svg ", `<svg style="background: ${app.canvas.clear_background_color}" `);
