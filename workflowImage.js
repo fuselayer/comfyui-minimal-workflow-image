@@ -215,7 +215,22 @@ class WorkflowImage {
 		DebugLogger.log(`updateView: dpr=${dpr}, css=${width}x${height}, backing=${app.canvas.canvas.width}x${app.canvas.canvas.height}, offset=[${app.canvas.ds.offset}]`);
 	}
 
-	async export(includeWorkflow) {
+	// Back-compat signature: export(includeWorkflow:boolean)
+	// New signature: export({ includeWorkflow?: boolean, transparent?: boolean })
+	async export(includeWorkflowOrOpts) {
+		// Normalize options
+		let includeWorkflow = false;
+		let transparent = false;
+		if (typeof includeWorkflowOrOpts === "object" && includeWorkflowOrOpts !== null) {
+			includeWorkflow = !!includeWorkflowOrOpts.includeWorkflow;
+			transparent = !!includeWorkflowOrOpts.transparent;
+		} else {
+			includeWorkflow = !!includeWorkflowOrOpts;
+			transparent = false;
+		}
+		// For SVG path
+		this._transparent = transparent;
+
 		DebugLogger.clear();
 		this.saveState();
 
@@ -226,27 +241,31 @@ class WorkflowImage {
 			const bounds = this.getBounds();
 			this.updateView(bounds);
 
-			// We draw our own full-size background (backing store coords)
-			const bg = getCanvasBackgroundColor();
 			const ctx = app.canvas.canvas.getContext("2d");
+			const bg = getCanvasBackgroundColor();
+
+			// Clear entire backing store to transparent
 			ctx.save();
 			if (typeof ctx.resetTransform === "function") ctx.resetTransform();
 			ctx.clearRect(0, 0, app.canvas.canvas.width, app.canvas.canvas.height);
-			ctx.fillStyle = bg;
-			ctx.fillRect(0, 0, app.canvas.canvas.width, app.canvas.canvas.height);
+			// If background requested, paint solid bg (in backing-store pixels)
+			if (!transparent) {
+				ctx.fillStyle = bg;
+				ctx.fillRect(0, 0, app.canvas.canvas.width, app.canvas.canvas.height);
+			}
 			ctx.restore();
 
-			// Disable engine background during export to prevent partial redraws
+			// Disable engine background during export so it doesn't repaint
 			const prevClear = app.canvas.clear_background;
 			const prevClearColor = app.canvas.clear_background_color;
-			app.canvas.clear_background = false;
+			app.canvas.clear_background = false; // we control bg fully
 			app.canvas.clear_background_color = bg;
 
 			getDrawTextConfig = this.getDrawTextConfig;
 			app.canvas.draw(true, true);
 			getDrawTextConfig = null;
 
-			// Restore those two flags immediately (full restore happens in finally)
+			// Restore flags immediately (full state restored in finally)
 			app.canvas.clear_background = prevClear;
 			app.canvas.clear_background_color = prevClearColor;
 
@@ -280,7 +299,7 @@ class WorkflowImage {
 		Object.assign(a, {
 			href: url,
 			download: "workflow." + this.extension,
-			style: "display: " + "none"
+			style: "display: none"
 		});
 		document.body.append(a);
 		a.click();
@@ -295,7 +314,7 @@ class WorkflowImage {
 			fileInput = document.createElement("input");
 			Object.assign(fileInput, {
 				type: "file",
-				style: "display: " + "none",
+				style: "display: none",
 				onchange: () => {
 					app.handleFile(fileInput.files[0]);
 				}
@@ -308,7 +327,7 @@ class WorkflowImage {
 }
 
 /* ======================================================================
-   PNG exporter
+   PNG exporter (uses on-screen canvas; respects transparent flag)
 ====================================================================== */
 
 class PngWorkflowImage extends WorkflowImage {
@@ -351,75 +370,62 @@ class PngWorkflowImage extends WorkflowImage {
 	}
 
 	async getBlob(workflow) {
-		return new Promise((resolve, reject) => {
+		return new Promise((resolve) => {
 			const canvasEl = app.canvas?.canvas;
 			if (!canvasEl) {
-				const err = new Error("ComfyUI canvas not found");
-				DebugLogger.log(err.message);
-				return reject(err);
+				console.error("ComfyUI canvas not found");
+				resolve(new Blob([], { type: "image/png" }));
+				return;
 			}
 
-			try {
-				canvasEl.toBlob(async (blob) => {
-					try {
-						if (!blob) {
-							// Some engines return null for tainted canvas
-							DebugLogger.log("canvas.toBlob returned null; attempting dataURL fallback…");
-							const dataURL = canvasEl.toDataURL("image/png"); // may throw if tainted
-							blob = dataURLToBlob(dataURL);
-						}
-
-						if (workflow) {
-							try {
-								const buffer = await blob.arrayBuffer();
-								const typedArr = new Uint8Array(buffer);
-								const view = new DataView(buffer);
-
-								const enc = new TextEncoder();
-								const type = enc.encode("tEXt");
-								const keyword = enc.encode("workflow");
-								const nullSep = new Uint8Array([0]);
-								const text = enc.encode(workflow);
-
-								// PNG tEXt: [len][type][keyword(<=79)][0x00][text][crc(type+data)]
-								const data = this.joinArrayBuffer(keyword, nullSep, text);
-								const lenBytes = this.n2b(data.byteLength);
-								const crcBytes = this.n2b(this.crc32(this.joinArrayBuffer(type, data)));
-								const chunk = this.joinArrayBuffer(lenBytes, type, data, crcBytes);
-
-								// Insert right after IHDR
-								const ihdrDataLen = view.getUint32(8, false);
-								const insertAt = 8 + 12 + ihdrDataLen;
-
-								const result = this.joinArrayBuffer(
-									typedArr.subarray(0, insertAt),
-									chunk,
-									typedArr.subarray(insertAt)
-								);
-								blob = new Blob([result], { type: "image/png" });
-							} catch (embedErr) {
-								DebugLogger.log("PNG embed failed: " + (embedErr?.stack || embedErr));
-								// continue with non-embedded blob
-							}
-						}
-
-						resolve(blob);
-					} catch (callbackErr) {
-						DebugLogger.log("toBlob callback failed: " + (callbackErr?.stack || callbackErr));
-						reject(callbackErr);
-					}
-				}, "image/png");
-			} catch (e) {
-				// Fallback if toBlob throws
-				DebugLogger.log("canvas.toBlob threw: " + (e?.stack || e));
-				try {
+			canvasEl.toBlob(async (blob) => {
+				if (!blob) {
+					// Fallback
 					const dataURL = canvasEl.toDataURL("image/png");
-					resolve(dataURLToBlob(dataURL));
-				} catch (e2) {
-					DebugLogger.log("dataURL fallback failed: " + (e2?.stack || e2));
-					reject(e2);
+					blob = dataURLToBlob(dataURL);
 				}
-			}
+
+				if (workflow) {
+					try {
+						// Insert a valid PNG tEXt chunk with keyword "workflow"
+						const buffer = await blob.arrayBuffer();
+						const typedArr = new Uint8Array(buffer);
+						const view = new DataView(buffer);
+
+						const enc = new TextEncoder();
+						const type = enc.encode("tEXt"); // 4-byte type
+						const keyword = enc.encode("workflow"); // keyword
+						const nullSep = new Uint8Array([0]); // 0x00
+						const text = enc.encode(workflow); // JSON payload
+
+						const data = this.joinArrayBuffer(keyword, nullSep, text); // keyword\0text
+						const lenBytes = this.n2b(data.byteLength);
+
+						// CRC is over type + data
+						const crcBytes = this.n2b(this.crc32(this.joinArrayBuffer(type, data)));
+
+						// Build the full chunk: [len][type][data][crc]
+						const chunk = this.joinArrayBuffer(lenBytes, type, data, crcBytes);
+
+						// Insert right after IHDR
+						// PNG layout: 8-byte signature, then IHDR: [len(4)][type(4)][data(len)][crc(4)]
+						const ihdrDataLen = view.getUint32(8, false); // big-endian length of IHDR data
+						const insertAt = 8 + 12 + ihdrDataLen; // signature + IHDR chunk (12 bytes header/crc + data)
+
+						const result = this.joinArrayBuffer(
+							typedArr.subarray(0, insertAt),
+							chunk,
+							typedArr.subarray(insertAt)
+						);
+
+						blob = new Blob([result], { type: "image/png" });
+					} catch (embedErr) {
+						console.warn("PNG embed failed:", embedErr);
+					}
+				}
+
+				resolve(blob);
+			}, "image/png");
 		});
 	}
 }
@@ -583,7 +589,7 @@ class Jpeg {
 }
 
 /* ======================================================================
-   SVG exporter
+   SVG exporter (transparent supported) — on-screen layout, SVG ctx for draw
 ====================================================================== */
 
 class SvgWorkflowImage extends WorkflowImage {
@@ -653,61 +659,48 @@ class SvgWorkflowImage extends WorkflowImage {
 		};
 	}
 
-	saveState() {
-		super.saveState();
-		this.state.ctx = app.canvas.ctx;
-	}
-	restoreState() {
-		super.restoreState();
-		app.canvas.ctx = this.state.ctx;
-	}
-
 	updateView(bounds) {
-		// Reuse parent’s DS/offset prep (raster dpr settings don't affect svgCtx)
+		// Reuse parent's DPR layout for consistent coordinates
 		super.updateView(bounds);
 		this.createSvgCtx(bounds);
 	}
 
 	createSvgCtx(bounds) {
+		const prevCtx = app.canvas.ctx || app.canvas.canvas.getContext("2d");
 		const width = bounds[2] - bounds[0];
 		const height = bounds[3] - bounds[1];
 		const dpr = Math.max(1, window.devicePixelRatio || 1);
 
-		// Create SVG at DPR-sized backing store, then scale content by DPR.
+		// Create SVG at DPR-sized backing store, then scale content by DPR
 		const svgCtx = (this.svgCtx = new C2S(Math.round(width * dpr), Math.round(height * dpr)));
 		svgCtx.canvas.getBoundingClientRect = function () {
 			return { width: svgCtx.width, height: svgCtx.height };
 		};
-
-		// Match PNG export pipeline: scale by DPR so engine drawing lands correctly
 		if (typeof svgCtx.scale === "function") {
 			svgCtx.scale(dpr, dpr);
 		} else if (typeof svgCtx.transform === "function") {
 			svgCtx.transform(dpr, 0, 0, dpr, 0, 0);
 		}
 
-		// Full-size background AFTER scale so width/height are logical units
-		const bg = getCanvasBackgroundColor();
-		svgCtx.save?.();
-		svgCtx.fillStyle = bg;
-		svgCtx.fillRect(0, 0, width, height);
-		svgCtx.restore?.();
+		// Optional solid background
+		if (!this._transparent) {
+			const bg = getCanvasBackgroundColor();
+			svgCtx.save?.();
+			svgCtx.fillStyle = bg;
+			svgCtx.fillRect(0, 0, width, height);
+			svgCtx.restore?.();
+		}
 
-		// Provide minimal canvas API compatibility
-		const prevCtx = this.state.ctx;
-
-		// Proxy getTransform/resetTransform to previous 2D context if needed
+		// Proxy helpers
 		svgCtx.getTransform = function () {
 			return prevCtx.getTransform();
 		};
 		svgCtx.resetTransform = function () {
 			return prevCtx.resetTransform();
 		};
-
-		// Ensure roundRect exists
 		svgCtx.roundRect = svgCtx.rect;
 
-		// Override drawImage to embed external IMG as bitmap
+		// Embed external IMG as bitmap
 		const drawImage = svgCtx.drawImage;
 		svgCtx.drawImage = function (...args) {
 			const image = args[0];
@@ -722,19 +715,33 @@ class SvgWorkflowImage extends WorkflowImage {
 			return drawImage.apply(this, args);
 		};
 
-		// Swap ctx so LGraphCanvas draws into our SVG
+		// Route engine drawing into our SVG context
+		this._prevCtx = app.canvas.ctx;
 		app.canvas.ctx = svgCtx;
+
+		// Prevent engine background during draw
+		this._prevClear = app.canvas.clear_background;
+		this._prevClearColor = app.canvas.clear_background_color;
+		app.canvas.clear_background = false;
 	}
 
 	getBlob(workflow) {
-		// Keep a style background as well (harmless redundancy)
-		let svg = this.svgCtx
-			.getSerializedSvg(true)
-			.replace("<svg ", `<svg style="background: ${app.canvas.clear_background_color}" `);
-
+		let svg = this.svgCtx.getSerializedSvg(true);
+		// Add a background style only when not transparent (cosmetic)
+		if (!this._transparent) {
+			svg = svg.replace("<svg ", `<svg style="background: ${app.canvas.clear_background_color || getCanvasBackgroundColor()}" `);
+		}
 		if (workflow) {
 			svg = svg.replace("</svg>", `<desc>${SvgWorkflowImage.escapeXml(workflow)}</desc></svg>`);
 		}
+
+		// Restore ctx/flags (paired with createSvgCtx)
+		app.canvas.ctx = this._prevCtx ?? app.canvas.ctx;
+		app.canvas.clear_background = this._prevClear ?? app.canvas.clear_background;
+		app.canvas.clear_background_color = this._prevClearColor ?? app.canvas.clear_background_color;
+		this._prevCtx = undefined;
+		this._prevClear = undefined;
+		this._prevClearColor = undefined;
 
 		return new Blob([svg], { type: "image/svg+xml" });
 	}
@@ -858,8 +865,35 @@ app.registerExtension({
 			LGraphCanvas.prototype.getCanvasMenuOptions = function () {
 				const options = orig.apply(this, arguments);
 
+				// Build 4 options per format:
+				// - with workflow, background
+				// - with workflow, transparent
+				// - no workflow, background
+				// - no workflow, transparent
+				const makeOptions = (FClass) => {
+					const name = FClass.name.replace("WorkflowImage", "").toLocaleLowerCase();
+					return [
+						{
+							content: `${name} (workflow, background)`,
+							callback: () => new FClass().export({ includeWorkflow: true, transparent: false })
+						},
+						{
+							content: `${name} (workflow, transparent)`,
+							callback: () => new FClass().export({ includeWorkflow: true, transparent: true })
+						},
+						{
+							content: `${name} (no workflow, background)`,
+							callback: () => new FClass().export({ includeWorkflow: false, transparent: false })
+						},
+						{
+							content: `${name} (no workflow, transparent)`,
+							callback: () => new FClass().export({ includeWorkflow: false, transparent: true })
+						}
+					];
+				};
+
 				options.push(null, {
-					content: "Workflow Image",
+					content: "Workflow Image (fuselayer)",
 					submenu: {
 						options: [
 							{
@@ -869,16 +903,7 @@ app.registerExtension({
 							{
 								content: "Export",
 								submenu: {
-									options: formats.flatMap((f) => [
-										{
-											content: f.name.replace("WorkflowImage", "").toLocaleLowerCase(),
-											callback: () => new f().export(true)
-										},
-										{
-											content: f.name.replace("WorkflowImage", "").toLocaleLowerCase() + " (no embedded workflow)",
-											callback: () => new f().export()
-										}
-									])
+									options: formats.flatMap((f) => makeOptions(f))
 								}
 							}
 						]
